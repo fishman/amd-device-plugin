@@ -61,7 +61,11 @@ func NewBestEffortPolicy() *BestEffortPolicy {
 func (b *BestEffortPolicy) getDevicesFromIds(ids []string) []*Device {
 	var res []*Device
 	for _, id := range ids {
-		res = append(res, b.devicesMap[id])
+		// Stale kubelet device ids across plugin restarts resolve to nil; skip
+		// them so Allocate errors cleanly instead of panicking in sort.Slice.
+		if d := b.devicesMap[id]; d != nil {
+			res = append(res, d)
+		}
 	}
 	return res
 }
