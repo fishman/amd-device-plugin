@@ -61,11 +61,12 @@ func NewBestEffortPolicy() *BestEffortPolicy {
 func (b *BestEffortPolicy) getDevicesFromIds(ids []string) []*Device {
 	var res []*Device
 	for _, id := range ids {
-		// Kubelet may report ids not in this plugin's device map (stale
-		// checkpoint entries); skip them instead of panicking downstream.
-		if d, ok := b.devicesMap[id]; ok {
-			res = append(res, d)
+		d, ok := b.devicesMap[id]
+		if !ok {
+			glog.Warningf("GPA policy: device id %q is not registered by this plugin; a second device plugin is likely running on this node and kubelet merged its devices. Disable the other plugin (or drain the node) and restart this plugin", id)
+			continue
 		}
+		res = append(res, d)
 	}
 	return res
 }
