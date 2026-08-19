@@ -61,11 +61,12 @@ func NewBestEffortPolicy() *BestEffortPolicy {
 func (b *BestEffortPolicy) getDevicesFromIds(ids []string) []*Device {
 	var res []*Device
 	for _, id := range ids {
-		// Stale kubelet device ids across plugin restarts resolve to nil; skip
-		// them so Allocate errors cleanly instead of panicking in sort.Slice.
-		if d := b.devicesMap[id]; d != nil {
-			res = append(res, d)
+		d, ok := b.devicesMap[id]
+		if !ok {
+			glog.Warningf("GPA policy: device id %q is not registered by this plugin; a second device plugin is likely running on this node and kubelet merged its devices. Disable the other plugin (or drain the node) and restart this plugin", id)
+			continue
 		}
+		res = append(res, d)
 	}
 	return res
 }
