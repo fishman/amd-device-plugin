@@ -232,14 +232,29 @@ func (p *AMDGPUPlugin) RegisterInAnnotation() error {
 	return err
 }
 
-// isSchedulableTopologyKey: a partitioned GPU parent has no capacity of its
-// own and never registers.
-func isSchedulableTopologyKey(key string, deviceData map[string]interface{}) bool {
-	if !strings.HasPrefix(key, "amdgpu_xcp_") {
-		computePartitionType, _ := deviceData["computePartitionType"].(string)
-		return computePartitionType == ""
+// isSchedulableTopologyKey: XCP partitions always register. A whole-GPU key
+// is unschedulable only when it is an XCP parent (its BDF has amdgpu_xcp_
+// children). gfx950 spx/dpx/qpx whole GPUs have no KFD children and keep
+// their own card, so they register normally.
+func isSchedulableTopologyKey(key string, deviceData map[string]interface{}, xcpChildren map[string]int) bool {
+	if strings.HasPrefix(key, "amdgpu_xcp_") {
+		return true
 	}
-	return true
+	bdf, _ := deviceData["devID"].(string)
+	return xcpChildren[bdf] == 0
+}
+
+// xcpChildrenByBDF counts amdgpu_xcp_ partition entries per parent PCI BDF.
+func xcpChildrenByBDF(devices map[string]map[string]interface{}) map[string]int {
+	children := make(map[string]int)
+	for key, d := range devices {
+		if strings.HasPrefix(key, "amdgpu_xcp_") {
+			if bdf, ok := d["devID"].(string); ok && bdf != "" {
+				children[bdf]++
+			}
+		}
+	}
+	return children
 }
 
 // Registers the whole-partition form of an XCP entry; the soft entry stays
@@ -282,15 +297,12 @@ func (p *AMDGPUPlugin) getAPIDevices() []*utils.DeviceInfo {
 	// Whole-GPU capacity is read once per GPU through libdrm. XCP partitions
 	// share their parent's PCI BDF and get an even share of that capacity.
 	wholeCardByBDF := make(map[string]int)
-	xcpCountByBDF := make(map[string]int)
+	xcpCountByBDF := xcpChildrenByBDF(p.AMDGPUs)
 	for key, deviceData := range p.AMDGPUs {
-		bdf, _ := deviceData["devID"].(string)
-		if bdf == "" {
+		if strings.HasPrefix(key, "amdgpu_xcp_") {
 			continue
 		}
-		if strings.HasPrefix(key, "amdgpu_xcp_") {
-			xcpCountByBDF[bdf]++
-		} else {
+		if bdf, ok := deviceData["devID"].(string); ok && bdf != "" {
 			wholeCardByBDF[bdf], _ = deviceData["card"].(int)
 		}
 	}
@@ -315,6 +327,7 @@ func (p *AMDGPUPlugin) getAPIDevices() []*utils.DeviceInfo {
 	p.rocrUUIDToTopology = make(map[string]string, len(p.AMDGPUs))
 	p.sortedBDFs = make([]string, 0, len(p.AMDGPUs))
 	p.bdfToROCrUUID = make(map[string]string, len(p.AMDGPUs))
+	glog.Infof("topology keys registered: %v", keys)
 
 	// Resolve a stable per-device UUID through the AMD SMI C API for whole
 	// GPUs. XCP partitions share the parent PCI BDF, so the BDF-keyed AMD SMI
@@ -347,7 +360,7 @@ func (p *AMDGPUPlugin) getAPIDevices() []*utils.DeviceInfo {
 	out := make([]*utils.DeviceInfo, 0, len(keys)*2)
 	for _, key := range keys {
 		deviceData := p.AMDGPUs[key]
-		if !isSchedulableTopologyKey(key, deviceData) {
+		if !isSchedulableTopologyKey(key, deviceData, xcpCountByBDF) {
 			glog.Infof("skip topology entry %s (no allocatable capacity)", key)
 			continue
 		}
@@ -512,9 +525,10 @@ func hardKubeletDeviceID(key string, deviceData map[string]interface{}) string {
 func (p *AMDGPUPlugin) getDevices() []*allocator.Device {
 	devices := amdgpu.GetAMDGPUs()
 	var deviceList []*allocator.Device
+	xcpCountByBDF := xcpChildrenByBDF(devices)
 
 	for id, deviceData := range devices {
-		if !isSchedulableTopologyKey(id, deviceData) {
+		if !isSchedulableTopologyKey(id, deviceData, xcpCountByBDF) {
 			continue
 		}
 		for splitIdx := 0; splitIdx < defaultSplitCount; splitIdx++ {
@@ -712,8 +726,9 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 	if isHomogeneous {
 		// limit scope for hwloc
 		func() {
+			xcpCountByBDF := xcpChildrenByBDF(p.AMDGPUs)
 			for id, device := range p.AMDGPUs {
-				if !isSchedulableTopologyKey(id, device) {
+				if !isSchedulableTopologyKey(id, device, xcpCountByBDF) {
 					continue
 				}
 				devs = append(devs, p.kubeletDevicesFor(id, device)...)
@@ -723,8 +738,9 @@ func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin
 		s.Send(&pluginapi.ListAndWatchResponse{Devices: devs})
 	} else {
 		func() {
+			xcpCountByBDF := xcpChildrenByBDF(p.AMDGPUs)
 			for id, device := range p.AMDGPUs {
-				if !isSchedulableTopologyKey(id, device) {
+				if !isSchedulableTopologyKey(id, device, xcpCountByBDF) {
 					continue
 				}
 				partitionType := device["computePartitionType"].(string) + "_" + device["memoryPartitionType"].(string)
@@ -784,8 +800,18 @@ func (p *AMDGPUPlugin) GetPreferredAllocation(ctx context.Context, req *pluginap
 		glog.Infof("GetPreferredAllocation: available=%v must=%v size=%d", req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, req.AllocationSize)
 		allocated_ids, err := p.devAllocator.Allocate(req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, int(req.AllocationSize))
 		if err != nil {
-			glog.Errorf("unable to get preferred allocation list. Error:%v", err)
-			return nil, fmt.Errorf("unable to get preferred allocation list. Error:%v", err)
+			// kubelet passes its checkpoint-persisted ids (bare BDFs from the
+			// pre-fork plugin), which the split-keyed allocator cannot map.
+			// GPA is advisory; Allocate resolves the pod annotation, so echo
+			// kubelet's own ids instead of failing admission.
+			glog.Warningf("preferred allocation failed (%v); echoing kubelet device ids", err)
+			allocated_ids = req.MustIncludeDeviceIDs
+			for _, id := range req.AvailableDeviceIDs {
+				if len(allocated_ids) >= int(req.AllocationSize) {
+					break
+				}
+				allocated_ids = append(allocated_ids, id)
+			}
 		}
 		resp := &pluginapi.ContainerPreferredAllocationResponse{
 			DeviceIDs: allocated_ids,
@@ -828,10 +854,12 @@ func (p *AMDGPUPlugin) deviceDataFromAllocationUUID(uuid, _ string) (map[string]
 	if i := parseAMDGPUIndex(uuid); i >= 0 {
 		// Upstream HAMi device i is the i-th split slot in registration order.
 		gpuIdx := i / defaultSplitCount
+		glog.Infof("resolving upstream AMDGPU id %s: index=%d gpuIdx=%d splitCount=%d sortedBDFs=%d", uuid, i, gpuIdx, defaultSplitCount, len(p.sortedBDFs))
 		if gpuIdx < len(p.sortedBDFs) {
 			if d, found := p.AMDGPUs[p.sortedBDFs[gpuIdx]]; found {
 				return d, nil
 			}
+			glog.Infof("resolved gpuIdx %d -> %s but missing from AMDGPUs", gpuIdx, p.sortedBDFs[gpuIdx])
 		}
 	}
 	return nil, fmt.Errorf("no local GPU topology entry for device id %q", uuid)

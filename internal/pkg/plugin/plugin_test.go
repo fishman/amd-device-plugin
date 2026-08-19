@@ -166,21 +166,23 @@ func assertAllocationWord(t *testing.T, allocations map[string]cuallocation.Allo
 }
 
 func TestIsSchedulableTopologyKey(t *testing.T) {
-	wholeGPU := map[string]interface{}{"computePartitionType": "spx", "memoryPartitionType": "nps1"}
-	partitionedParent := map[string]interface{}{"computePartitionType": "cpx", "memoryPartitionType": "nps1"}
-	noPartition := map[string]interface{}{"computePartitionType": "", "memoryPartitionType": ""}
-	xcp := map[string]interface{}{"computePartitionType": "cpx", "memoryPartitionType": "nps1"}
+	wholeGPU := map[string]interface{}{"devID": "0000:05:00.0", "computePartitionType": "spx", "memoryPartitionType": "nps1"}
+	partitionedParent := map[string]interface{}{"devID": "0000:15:00.0", "computePartitionType": "cpx", "memoryPartitionType": "nps1"}
+	noPartition := map[string]interface{}{"devID": "0000:75:00.0", "computePartitionType": "", "memoryPartitionType": ""}
+	xcp := map[string]interface{}{"devID": "0000:15:00.0", "computePartitionType": "cpx", "memoryPartitionType": "nps1"}
+	withChildren := xcpChildrenByBDF(map[string]map[string]interface{}{"amdgpu_xcp_30": xcp})
+	withoutChildren := xcpChildrenByBDF(map[string]map[string]interface{}{"0000:05:00.0": wholeGPU})
 
-	if !isSchedulableTopologyKey("amdgpu_xcp_30", xcp) {
+	if !isSchedulableTopologyKey("amdgpu_xcp_30", xcp, withChildren) {
 		t.Error("XCP partition should be schedulable")
 	}
-	if isSchedulableTopologyKey("0000:05:00.0", wholeGPU) {
-		t.Error("SPX-partitioned GPU parent has no capacity and must be skipped")
+	if !isSchedulableTopologyKey("0000:05:00.0", wholeGPU, withoutChildren) {
+		t.Error("SPX whole GPU with no XCP children should be schedulable (gfx950)")
 	}
-	if isSchedulableTopologyKey("0000:15:00.0", partitionedParent) {
-		t.Error("partitioned GPU parent has no capacity and must be skipped")
+	if isSchedulableTopologyKey("0000:15:00.0", partitionedParent, withChildren) {
+		t.Error("XCP parent whose BDF has partition children has no capacity and must be skipped")
 	}
-	if !isSchedulableTopologyKey("0000:75:00.0", noPartition) {
+	if !isSchedulableTopologyKey("0000:75:00.0", noPartition, withoutChildren) {
 		t.Error("GPU without partition support should be schedulable")
 	}
 }
