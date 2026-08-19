@@ -61,7 +61,11 @@ func NewBestEffortPolicy() *BestEffortPolicy {
 func (b *BestEffortPolicy) getDevicesFromIds(ids []string) []*Device {
 	var res []*Device
 	for _, id := range ids {
-		res = append(res, b.devicesMap[id])
+		// Kubelet may report ids not in this plugin's device map (stale
+		// checkpoint entries); skip them instead of panicking downstream.
+		if d, ok := b.devicesMap[id]; ok {
+			res = append(res, d)
+		}
 	}
 	return res
 }
